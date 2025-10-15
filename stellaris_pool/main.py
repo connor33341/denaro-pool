@@ -467,14 +467,15 @@ def validate_share(block_hash: str, difficulty: float, target_difficulty: Option
         return False, False
     
     last_block = pool_state.current_work['last_block']
-    chunk = last_block.get('hash', (30_06_2005).to_bytes(32, ENDIAN).hex())[-int(difficulty):]
+    previous_hash = last_block.get('hash', (30_06_2005).to_bytes(32, ENDIAN).hex())
     
-    # Check if hash meets pool difficulty (easier)
-    pool_chunk = chunk[-int(pool_difficulty):] if pool_difficulty < difficulty else chunk
-    is_valid_share = block_hash.startswith(pool_chunk)
-    
-    # Check if hash meets network difficulty (harder - actual block)
+    # Network difficulty: hash must start with last N chars of previous hash
+    chunk = previous_hash[-int(difficulty):]
     is_valid_block = block_hash.startswith(chunk)
+    
+    # Pool difficulty: hash must start with last N chars of previous hash (easier)
+    pool_chunk = previous_hash[-int(pool_difficulty):]
+    is_valid_share = block_hash.startswith(pool_chunk)
     
     return is_valid_share, is_valid_block
 

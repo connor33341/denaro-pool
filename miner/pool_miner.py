@@ -213,7 +213,7 @@ class PoolMiner:
                    timestamp: int, nonce_start: int, nonce_end: int, transactions: list):
         """Mine within a specific nonce range"""
         
-        # Setup difficulty checking
+        # Setup difficulty checking (matching Stellaris miner.py exactly)
         chunk = previous_hash[-int(difficulty):]
         decimal = difficulty % 1
         
@@ -223,60 +223,75 @@ class PoolMiner:
             charset = charset[:count]
             idifficulty = int(difficulty)
             
-            def check_block_is_valid(block_hash: str) -> bool:
+            def check_block_is_valid(block_content: bytes) -> bool:
+                block_hash = hashlib.sha256(block_content).hexdigest()
                 return block_hash.startswith(chunk) and block_hash[idifficulty] in charset
         else:
-            def check_block_is_valid(block_hash: str) -> bool:
-                return block_hash.startswith(chunk)
+            def check_block_is_valid(block_content: bytes) -> bool:
+                return hashlib.sha256(block_content).hexdigest().startswith(chunk)
         
-        # For pool mining, also check for shares (easier difficulty)
+        # For pool mining, we submit shares with easier difficulty
+        # Network difficulty: e.g., 7.9 means hash must start with last 7.9 chars of previous hash
+        # Pool difficulty: we use 10% of network difficulty (e.g., 0.79) for more frequent shares
         pool_difficulty = max(1.0, difficulty * 0.1)
-        pool_chunk = chunk[-int(pool_difficulty):] if pool_difficulty < difficulty else chunk
+        pool_chunk = previous_hash[-int(pool_difficulty):]
         
         def check_pool_share(block_hash: str) -> bool:
+            """Check if hash meets easier pool difficulty"""
             return block_hash.startswith(pool_chunk)
         
-        # Prepare block header
+        # Prepare block header (MUST match Stellaris format exactly)
         address_bytes = string_to_bytes(pool_address)
         
-        # Build prefix
-        prefix_parts = [bytes.fromhex(previous_hash)]
-        
-        # Add version byte if needed (for compressed addresses)
-        if len(address_bytes) == 33:
-            prefix_parts.insert(0, (2).to_bytes(1, 'little'))
-        
-        prefix_parts.extend([
-            address_bytes,
-            bytes.fromhex(merkle_root),
-            timestamp.to_bytes(4, byteorder='little'),
+        # Build prefix: previous_hash + address + merkle_root + timestamp + difficulty
+        prefix = (
+            bytes.fromhex(previous_hash) +
+            address_bytes +
+            bytes.fromhex(merkle_root) +
+            timestamp.to_bytes(4, byteorder='little') +
             int(difficulty * 10).to_bytes(2, 'little')
-        ])
+        )
         
-        prefix = b''.join(prefix_parts)
+        # Add version byte at the BEGINNING if compressed address (33 bytes)
+        if len(address_bytes) == 33:
+            prefix = (2).to_bytes(1, 'little') + prefix
         
         # Mining loop
         t = time.time()
         i = nonce_start
-        check_interval = 50000  # Check for shares every N hashes
+        check_interval = 10000  # Check for shares every 10k hashes (more frequent)
+        last_share_check = nonce_start
+        
+        # Debug: print first hash to verify format
+        if worker_id == 0 and nonce_start == 0:
+            test_content = prefix + (0).to_bytes(4, 'little')
+            test_hash = hashlib.sha256(test_content).hexdigest()
+            print(f"Debug - First hash attempt:")
+            print(f"  Block content length: {len(test_content)} bytes")
+            print(f"  First hash: {test_hash}")
+            print(f"  Target chunk: {chunk}")
+            print(f"  Pool chunk: {pool_chunk}")
         
         while i < nonce_end:
             # Use 4 bytes for nonce (Stellaris format)
             block_content = prefix + i.to_bytes(4, 'little')
-            block_hash = hashlib.sha256(block_content).hexdigest()
             
             # Check if valid block (network difficulty)
-            if check_block_is_valid(block_hash):
+            if check_block_is_valid(block_content):
+                block_hash = hashlib.sha256(block_content).hexdigest()
                 print(f"🎉 Worker {worker_id + 1}: VALID BLOCK FOUND!")
                 return (i, block_content.hex(), block_hash, True)
             
-            # Check if valid share (pool difficulty)
-            if (i - nonce_start) % check_interval == 0 and check_pool_share(block_hash):
-                elapsed = time.time() - t
-                if elapsed > 0:
-                    hashrate = (i - nonce_start) / elapsed / 1000
-                    print(f"Worker {worker_id + 1}: {hashrate:.1f} kH/s - Submitting share")
-                return (i, block_content.hex(), block_hash, False)
+            # Check if valid share (pool difficulty) - check every interval
+            if (i - last_share_check) >= check_interval:
+                block_hash = hashlib.sha256(block_content).hexdigest()
+                if check_pool_share(block_hash):
+                    elapsed = time.time() - t
+                    if elapsed > 0:
+                        hashrate = (i - nonce_start) / elapsed / 1000
+                        print(f"Worker {worker_id + 1}: {hashrate:.1f} kH/s - Submitting share")
+                    return (i, block_content.hex(), block_hash, False)
+                last_share_check = i
             
             i += 1
             

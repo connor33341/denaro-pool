@@ -13,6 +13,15 @@ from math import ceil
 from multiprocessing import Process, Queue, Value
 import uuid
 import argparse
+import base58
+
+
+def string_to_bytes(string: str) -> bytes:
+    """Convert address string to bytes, supporting both hex and base58 formats"""
+    try:
+        return bytes.fromhex(string)
+    except ValueError:
+        return base58.b58decode(string)
 
 
 def get_transactions_merkle_tree(transactions):
@@ -212,7 +221,7 @@ class PoolMiner:
             return block_hash.startswith(pool_chunk)
         
         # Prepare block header
-        address_bytes = bytes.fromhex(pool_address) if len(pool_address) == 66 else bytes.fromhex(pool_address)
+        address_bytes = string_to_bytes(pool_address)
         
         # Build prefix
         prefix_parts = [bytes.fromhex(previous_hash)]

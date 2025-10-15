@@ -17,6 +17,7 @@ pydantic==2.5.0
 
 # Cryptography (from stellaris requirements)
 fastecdsa==2.3.2
+base58==2.1.1
 
 # Additional utilities
 aiofiles==23.2.1

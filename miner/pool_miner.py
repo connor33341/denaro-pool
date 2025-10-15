@@ -211,7 +211,7 @@ class PoolMiner:
     def mine_range(self, worker_id: int, block_height: int, difficulty: float,
                    previous_hash: str, pool_address: str, merkle_root: str,
                    timestamp: int, nonce_start: int, nonce_end: int, transactions: list):
-        """Mine within a specific nonce range"""
+        """Mine within a specific nonce range at FULL network difficulty"""
         
         # Setup difficulty checking (matching Stellaris miner.py exactly)
         chunk = previous_hash[-int(difficulty):]
@@ -230,16 +230,6 @@ class PoolMiner:
             def check_block_is_valid(block_content: bytes) -> bool:
                 return hashlib.sha256(block_content).hexdigest().startswith(chunk)
         
-        # For pool mining, we submit shares with easier difficulty
-        # Network difficulty: e.g., 7.9 means hash must start with last 7.9 chars of previous hash
-        # Pool difficulty: we use 10% of network difficulty (e.g., 0.79) for more frequent shares
-        pool_difficulty = max(1.0, difficulty * 0.1)
-        pool_chunk = previous_hash[-int(pool_difficulty):]
-        
-        def check_pool_share(block_hash: str) -> bool:
-            """Check if hash meets easier pool difficulty"""
-            return block_hash.startswith(pool_chunk)
-        
         # Prepare block header (MUST match Stellaris format exactly)
         address_bytes = string_to_bytes(pool_address)
         
@@ -256,54 +246,46 @@ class PoolMiner:
         if len(address_bytes) == 33:
             prefix = (2).to_bytes(1, 'little') + prefix
         
-        # Mining loop
+        # Mining loop - mine at FULL network difficulty
         t = time.time()
         i = nonce_start
-        check_interval = 10000  # Check for shares every 10k hashes (more frequent)
-        last_share_check = nonce_start
-        
-        # Debug: print first hash to verify format
-        if worker_id == 0 and nonce_start == 0:
-            test_content = prefix + (0).to_bytes(4, 'little')
-            test_hash = hashlib.sha256(test_content).hexdigest()
-            print(f"Debug - First hash attempt:")
-            print(f"  Block content length: {len(test_content)} bytes")
-            print(f"  First hash: {test_hash}")
-            print(f"  Target chunk: {chunk}")
-            print(f"  Pool chunk: {pool_chunk}")
+        hashrate_check = 5_000_000  # Report hashrate every 5M hashes (like Stellaris)
+        timeout = 280  # Timeout after 280 seconds (like Stellaris)
         
         while i < nonce_end:
             # Use 4 bytes for nonce (Stellaris format)
             block_content = prefix + i.to_bytes(4, 'little')
             
-            # Check if valid block (network difficulty)
+            # Check if valid block (FULL network difficulty)
             if check_block_is_valid(block_content):
                 block_hash = hashlib.sha256(block_content).hexdigest()
-                print(f"🎉 Worker {worker_id + 1}: VALID BLOCK FOUND!")
+                elapsed = time.time() - t
+                hashrate = (i - nonce_start) / elapsed / 1000 if elapsed > 0 else 0
+                print(f"🎉🎉🎉 Worker {worker_id + 1}: VALID BLOCK FOUND! 🎉🎉🎉")
+                print(f"   Nonce: {i:,}")
+                print(f"   Hash: {block_hash}")
+                print(f"   Hashrate: {hashrate:.1f} kH/s")
                 return (i, block_content.hex(), block_hash, True)
-            
-            # Check if valid share (pool difficulty) - check every interval
-            if (i - last_share_check) >= check_interval:
-                block_hash = hashlib.sha256(block_content).hexdigest()
-                if check_pool_share(block_hash):
-                    elapsed = time.time() - t
-                    if elapsed > 0:
-                        hashrate = (i - nonce_start) / elapsed / 1000
-                        print(f"Worker {worker_id + 1}: {hashrate:.1f} kH/s - Submitting share")
-                    return (i, block_content.hex(), block_hash, False)
-                last_share_check = i
             
             i += 1
             
             # Print hashrate periodically
-            if (i - nonce_start) % 500000 == 0:
+            if (i - nonce_start) % hashrate_check == 0 and i > nonce_start:
                 elapsed = time.time() - t
                 if elapsed > 0:
                     hashrate = (i - nonce_start) / elapsed / 1000
-                    print(f"Worker {worker_id + 1}: {hashrate:.1f} kH/s")
+                    progress = (i - nonce_start) / (nonce_end - nonce_start) * 100
+                    print(f"Worker {worker_id + 1}: {hashrate:.1f} kH/s ({progress:.1f}% of range)")
+            
+            # Timeout check (like Stellaris miner)
+            if time.time() - t > timeout:
+                print(f"Worker {worker_id + 1}: Timeout reached ({timeout}s), requesting new work")
+                return None
         
-        # Range exhausted without finding share
-        print(f"Worker {worker_id + 1}: Nonce range exhausted, requesting new work")
+        # Range exhausted without finding block - this is normal
+        elapsed = time.time() - t
+        hashrate = (nonce_end - nonce_start) / elapsed / 1000 if elapsed > 0 else 0
+        print(f"Worker {worker_id + 1}: Range exhausted ({hashrate:.1f} kH/s), requesting new work")
         return None
 
 

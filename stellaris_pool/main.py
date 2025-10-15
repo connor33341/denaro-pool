@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, List, Dict
 from collections import defaultdict
+from math import ceil
 import os
 import sys
 import json
@@ -422,8 +423,9 @@ async def get_work_for_miner(miner_id: str) -> WorkAssignment:
     
     work = pool_state.current_work
     
-    # Assign nonce range (1 million nonces per request)
-    nonce_range_size = 1_000_000
+    # Assign nonce range - larger ranges since miners work at full difficulty
+    # 10 million nonces per range (about 10-30 seconds of work at typical speeds)
+    nonce_range_size = 10_000_000
     max_nonce = 2**32 - 1  # Maximum value for 4-byte nonce (Stellaris uses 4 bytes)
     
     # Reset if we're approaching the limit
@@ -456,13 +458,10 @@ async def get_work_for_miner(miner_id: str) -> WorkAssignment:
 # ==================== Share Validation ====================
 def validate_share(block_hash: str, difficulty: float, target_difficulty: Optional[float] = None) -> tuple[bool, bool]:
     """
-    Validate if a share meets pool difficulty and/or network difficulty
+    Validate if a share meets network difficulty
+    For pool mining, we only accept VALID BLOCKS at full network difficulty
     Returns: (is_valid_share, is_valid_block)
     """
-    # For pool shares, we can use a lower difficulty (e.g., 1/10th of network difficulty)
-    pool_difficulty = max(1.0, difficulty * 0.1)  # Pool accepts easier shares
-    
-    # Get the previous block hash chunk needed for validation
     if not pool_state.current_work:
         return False, False
     
@@ -471,13 +470,25 @@ def validate_share(block_hash: str, difficulty: float, target_difficulty: Option
     
     # Network difficulty: hash must start with last N chars of previous hash
     chunk = previous_hash[-int(difficulty):]
-    is_valid_block = block_hash.startswith(chunk)
     
-    # Pool difficulty: hash must start with last N chars of previous hash (easier)
-    pool_chunk = previous_hash[-int(pool_difficulty):]
-    is_valid_share = block_hash.startswith(pool_chunk)
+    # Check decimal part for partial character matching
+    decimal = difficulty % 1
+    if decimal > 0:
+        charset = '0123456789abcdef'
+        count = ceil(16 * (1 - decimal))
+        charset = charset[:count]
+        idifficulty = int(difficulty)
+        
+        is_valid = (
+            block_hash.startswith(chunk) and 
+            len(block_hash) > idifficulty and
+            block_hash[idifficulty] in charset
+        )
+    else:
+        is_valid = block_hash.startswith(chunk)
     
-    return is_valid_share, is_valid_block
+    # For pool mining: valid share = valid block (no easy shares)
+    return is_valid, is_valid
 
 
 # ==================== API Endpoints ====================
@@ -567,7 +578,10 @@ async def get_work(request: WorkRequest):
 
 @app.post("/api/share")
 async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks):
-    """Submit a mining share"""
+    """
+    Submit a mining result (only valid blocks are submitted in this pool model)
+    Miners mine at full difficulty and submit only when they find a valid block
+    """
     try:
         # Validate nonce range (Stellaris uses 4-byte nonce)
         if share.nonce < 0 or share.nonce > 2**32 - 1:
@@ -584,60 +598,50 @@ async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks
                 "current_height": pool_state.current_work_height
             }
         
-        # Validate nonce is in assigned range
-        if share.miner_id in pool_state.nonce_ranges:
-            nonce_start, nonce_end = pool_state.nonce_ranges[share.miner_id]
-            if not (nonce_start <= share.nonce < nonce_end):
-                return {
-                    "success": False,
-                    "message": "Nonce outside assigned range"
-                }
-        
-        # Validate the share
+        # Validate the block
         difficulty = pool_state.current_work['difficulty']
         is_valid_share, is_valid_block = validate_share(share.block_hash, difficulty)
         
-        if not is_valid_share:
+        if not is_valid_block:
+            # This means the miner submitted an invalid block
+            # In production pool mining, we only accept valid blocks
+            print(f"⚠️  {share.miner_id} submitted invalid block: {share.block_hash}")
             return {
                 "success": False,
-                "message": "Share does not meet difficulty requirement"
+                "message": "Block does not meet network difficulty"
             }
         
-        # Record share in database
+        # Valid block found!
+        print(f"🎉 VALID BLOCK FOUND by {share.miner_id}! Block #{share.block_height}")
+        print(f"   Hash: {share.block_hash}")
+        
+        # Record block in database (track who found it for rewards)
         await record_share_db(
             share.miner_id,
             share.block_height,
-            is_valid_block,
-            share.block_hash if is_valid_block else None,
+            True,  # is_valid_block
+            share.block_hash,
             difficulty
         )
         
-        # Update round stats
+        # Update round stats - this miner found the block!
         pool_state.round_shares[share.miner_id] += 1
         pool_state.update_miner_activity(share.miner_id, shares=1)
         
-        # If this is a valid block, submit it!
-        if is_valid_block:
-            print(f"🎉 BLOCK FOUND by {share.miner_id}! Block #{share.block_height}")
-            background_tasks.add_task(
-                handle_found_block,
-                share.miner_id,
-                share.block_height,
-                share.block_content_hex,
-                share.block_hash
-            )
-            
-            return {
-                "success": True,
-                "message": "BLOCK FOUND! Submitting to network...",
-                "block_found": True,
-                "block_height": share.block_height
-            }
+        # Submit block to network
+        background_tasks.add_task(
+            handle_found_block,
+            share.miner_id,
+            share.block_height,
+            share.block_content_hex,
+            share.block_hash
+        )
         
         return {
             "success": True,
-            "message": "Share accepted",
-            "shares_this_round": pool_state.round_shares[share.miner_id]
+            "message": "BLOCK FOUND! Submitting to network...",
+            "block_found": True,
+            "block_height": share.block_height
         }
         
     except Exception as e:

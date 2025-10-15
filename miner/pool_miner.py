@@ -155,6 +155,18 @@ class PoolMiner:
                 print(f"Worker {worker_id + 1}: Mining block #{block_height}, difficulty {difficulty}")
                 print(f"   Nonce range: {nonce_start:,} - {nonce_end:,}")
                 
+                # Validate nonce range
+                if nonce_start < 0 or nonce_end < 0:
+                    print(f"❌ Worker {worker_id + 1}: Invalid nonce range (negative values)")
+                    time.sleep(5)
+                    continue
+                
+                # Stellaris uses 4-byte nonce, max value is 2^32 - 1
+                if nonce_end > 2**32 - 1:
+                    print(f"❌ Worker {worker_id + 1}: Nonce range exceeds 32-bit limit (Stellaris uses 4-byte nonce)")
+                    time.sleep(5)
+                    continue
+                
                 # Mine the assigned range
                 result = self.mine_range(
                     worker_id,
@@ -188,8 +200,12 @@ class PoolMiner:
                             shares = response.get('shares_this_round', 0)
                             print(f"✅ Worker {worker_id + 1}: Share accepted ({shares} shares this round)")
                 
+            except KeyboardInterrupt:
+                raise
             except Exception as e:
+                import traceback
                 print(f"❌ Worker {worker_id + 1} error: {e}")
+                print(f"   Traceback: {traceback.format_exc()}")
                 time.sleep(5)
     
     def mine_range(self, worker_id: int, block_height: int, difficulty: float,
@@ -245,6 +261,7 @@ class PoolMiner:
         check_interval = 50000  # Check for shares every N hashes
         
         while i < nonce_end:
+            # Use 4 bytes for nonce (Stellaris format)
             block_content = prefix + i.to_bytes(4, 'little')
             block_hash = hashlib.sha256(block_content).hexdigest()
             

@@ -424,8 +424,15 @@ async def get_work_for_miner(miner_id: str) -> WorkAssignment:
     
     # Assign nonce range (1 million nonces per request)
     nonce_range_size = 1_000_000
+    max_nonce = 2**32 - 1  # Maximum value for 4-byte nonce (Stellaris uses 4 bytes)
+    
+    # Reset if we're approaching the limit
+    if pool_state.next_nonce_start > max_nonce - nonce_range_size:
+        print(f"⚠️  Nonce space exhausted at {pool_state.next_nonce_start:,}, resetting to 0")
+        pool_state.next_nonce_start = 0
+    
     nonce_start = pool_state.next_nonce_start
-    nonce_end = nonce_start + nonce_range_size
+    nonce_end = min(nonce_start + nonce_range_size, max_nonce)
     
     pool_state.nonce_ranges[miner_id] = (nonce_start, nonce_end)
     pool_state.next_nonce_start = nonce_end
@@ -561,6 +568,13 @@ async def get_work(request: WorkRequest):
 async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks):
     """Submit a mining share"""
     try:
+        # Validate nonce range (Stellaris uses 4-byte nonce)
+        if share.nonce < 0 or share.nonce > 2**32 - 1:
+            return {
+                "success": False,
+                "message": "Invalid nonce value (must be 32-bit)"
+            }
+        
         # Validate share is for current work
         if share.block_height != pool_state.current_work_height:
             return {
@@ -626,7 +640,13 @@ async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Share submission failed: {str(e)}")
+        print(f"❌ Share submission error from {share.miner_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Share processing failed: {str(e)}"
+        }
 
 
 @app.get("/api/stats")
@@ -694,7 +714,7 @@ async def handle_found_block(miner_id: str, block_height: int, block_content: st
             
             # Get the actual block reward using Stellaris reward calculation
             block_reward = get_block_reward(block_height)
-            print(f"💰 Block reward: {block_reward} DNR")
+            print(f"💰 Block reward: {block_reward} STR")
             
             # Record block in database
             await record_block_db(block_height, block_hash, miner_id, block_reward)

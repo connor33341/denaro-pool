@@ -49,6 +49,7 @@ echo "✅ Python 3 found: $(python3 --version)"
 echo ""
 echo "📦 Installing Python dependencies..."
 pip install -r requirements.txt
+pip install -r stellaris/requirements.txt
 
 echo ""
 echo "✅ Setup complete!"

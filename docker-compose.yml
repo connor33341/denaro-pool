@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # Stellaris Mining Pool Server
+  pool:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stellaris-pool
+    environment:
+      - STELLARIS_NODE_URL=${STELLARIS_NODE_URL:-https://stellaris-node.connor33341.dev/}
+      - POOL_WALLET_ADDRESS=${POOL_WALLET_ADDRESS}
+      - POOL_PRIVATE_KEY=${POOL_PRIVATE_KEY}
+      - POOL_FEE_PERCENT=${POOL_FEE_PERCENT:-2.0}
+      - FINDER_BONUS_PERCENT=${FINDER_BONUS_PERCENT:-5.0}
+      - MIN_PAYOUT_AMOUNT=${MIN_PAYOUT_AMOUNT:-1.0}
+      - DATA_DIR=/app/data/pool
+      - HOST=0.0.0.0
+      - PORT=8000
+    ports:
+      - "8000:8000"
+    networks:
+      - pool-network
+    volumes:
+      - ./stellaris_pool:/app/stellaris_pool
+      - ./stellaris:/app/stellaris
+      - pool-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: Pool Miner (for testing)
+  # Uncomment to run a miner connected to the pool
+  # miner:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: stellaris-pool-miner
+  #   command: python stellaris_pool/pool_miner.py ${MINER_WALLET_ADDRESS} --pool http://pool:8000 --workers 2 --name docker-miner
+  #   depends_on:
+  #     - pool
+  #   networks:
+  #     - pool-network
+  #   restart: unless-stopped
+
+networks:
+  pool-network:
+    driver: bridge
+
+volumes:
+  pool-data:

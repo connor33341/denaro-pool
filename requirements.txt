@@ -1,0 +1,22 @@
+# Stellaris Mining Pool Requirements
+
+# FastAPI and web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# HTTP client
+httpx==0.25.1
+requests==2.31.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Validation
+pydantic==2.5.0
+
+# Cryptography (from stellaris requirements)
+fastecdsa==2.3.2
+
+# Additional utilities
+aiofiles==23.2.1

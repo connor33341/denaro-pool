@@ -247,10 +247,13 @@ class PoolDatabase:
     async def add_payout_records(self, miner_payouts: List[Dict], block_height: int):
         """Add payout records for a block"""
         for payout in miner_payouts:
+            # Quantize amount to 6 decimal places for blockchain compatibility
+            amount = Decimal(str(payout['amount'])).quantize(Decimal('0.000001'))
+            
             record = {
                 'id': len(self.payouts) + 1,
                 'miner_id': payout['miner_id'],
-                'amount': str(payout['amount']),
+                'amount': str(amount),
                 'tx_hash': None,
                 'block_height': block_height,
                 'paid_at': datetime.utcnow().isoformat(),
@@ -261,8 +264,9 @@ class PoolDatabase:
             # Update miner pending balance
             if payout['miner_id'] in self.miners:
                 current = Decimal(self.miners[payout['miner_id']]['pending_balance'])
+                new_balance = current + amount
                 self.miners[payout['miner_id']]['pending_balance'] = str(
-                    current + Decimal(str(payout['amount']))
+                    new_balance.quantize(Decimal('0.000001'))
                 )
         
         await self._save_to_file(self.payouts_file, {'payouts': self.payouts})

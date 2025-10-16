@@ -352,9 +352,11 @@ async def create_payout_transaction(payouts: List[Dict]) -> Optional[str]:
         # Create transaction outputs (payouts)
         outputs = []
         for payout in payouts:
+            # Quantize amount to 6 decimal places to match SMALLEST (1000000)
+            amount = Decimal(str(payout['amount'])).quantize(Decimal('0.000001'))
             output = TransactionOutput(
                 address=payout['address'],
-                amount=payout['amount']
+                amount=amount
             )
             outputs.append(output)
         
@@ -362,6 +364,7 @@ async def create_payout_transaction(payouts: List[Dict]) -> Optional[str]:
         fee = Decimal("0.01")
         change = total_input - total_payout - fee
         if change > Decimal("0.001"):  # Only add change if significant
+            change = change.quantize(Decimal('0.000001'))
             change_output = TransactionOutput(
                 address=POOL_WALLET_ADDRESS,
                 amount=change
@@ -924,9 +927,12 @@ async def calculate_and_record_payouts(finder_id: str, reward: Decimal, block_he
         if remaining > 0 and total_work > 0:
             for miner_id, work_units in pool_state.round_work.items():
                 share_reward = (remaining * Decimal(work_units)) / Decimal(total_work)
+                # Quantize to 6 decimal places (SMALLEST = 1000000 supports 6 decimals)
+                share_reward = share_reward.quantize(Decimal('0.000001'))
                 payouts[miner_id] = payouts.get(miner_id, Decimal(0)) + share_reward
         
         # Add finder bonus to the miner who found the block
+        finder_bonus_amount = finder_bonus_amount.quantize(Decimal('0.000001'))
         payouts[finder_id] = payouts.get(finder_id, Decimal(0)) + finder_bonus_amount
         
         # Update pending balances in database
@@ -970,9 +976,11 @@ async def payout_processor_task():
                 payouts = []
                 miner_ids = []
                 for miner in miners:
+                    # Quantize amount to 6 decimal places to match SMALLEST (1000000)
+                    amount = Decimal(str(miner['pending_balance'])).quantize(Decimal('0.000001'))
                     payouts.append({
                         'address': miner['wallet_address'],
-                        'amount': Decimal(str(miner['pending_balance']))
+                        'amount': amount
                     })
                     miner_ids.append(miner['miner_id'])
                 

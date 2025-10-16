@@ -420,13 +420,22 @@ async def update_work():
         mining_info = await fetch_mining_info()
         
         new_height = mining_info['last_block']['id'] + 1
+        new_merkle = mining_info['merkle_root']
         
-        # Check if we have new work
-        if pool_state.current_work_height != new_height:
-            print(f"📦 New work available: Block #{new_height}, Difficulty: {mining_info['difficulty']}")
-            pool_state.current_work = mining_info
-            pool_state.current_work_height = new_height
-            pool_state.reset_round()
+        # Check if we have new work (new block height OR new merkle root)
+        # Merkle root changes when pending transactions change
+        current_merkle = pool_state.current_work.get('merkle_root') if pool_state.current_work else None
+        
+        if pool_state.current_work_height != new_height or current_merkle != new_merkle:
+            if pool_state.current_work_height != new_height:
+                print(f"📦 New work available: Block #{new_height}, Difficulty: {mining_info['difficulty']}")
+                pool_state.current_work = mining_info
+                pool_state.current_work_height = new_height
+                pool_state.reset_round()
+            elif current_merkle != new_merkle:
+                print(f"📝 Updated merkle root for block #{new_height} (transactions changed)")
+                pool_state.current_work = mining_info
+                # Don't reset round for merkle root changes - miners can continue with new work
             
         return True
     except Exception as e:
@@ -436,8 +445,9 @@ async def update_work():
 
 async def get_work_for_miner(miner_id: str) -> WorkAssignment:
     """Assign work to a miner with unique nonce range"""
-    if not pool_state.current_work:
-        await update_work()
+    # Always update work to ensure we have the latest merkle_root and transactions
+    # Even if block height hasn't changed, pending transactions may have changed
+    await update_work()
     
     if not pool_state.current_work:
         raise HTTPException(status_code=503, detail="No work available from Stellaris node")

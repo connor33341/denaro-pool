@@ -79,7 +79,7 @@ class PoolMiner:
     
     def submit_share(self, block_height: int, nonce: int, block_content_hex: str, 
                      block_hash: str, is_valid_block: bool = False):
-        """Submit a share to the pool"""
+        """Submit a valid block to the pool"""
         try:
             response = self.session.post(
                 f"{self.pool_url}/api/share",
@@ -97,6 +97,29 @@ class PoolMiner:
             return response.json()
         except Exception as e:
             print(f"❌ Error submitting share: {e}")
+            return None
+    
+    def submit_work_proof(self, block_height: int, nonce_start: int, nonce_end: int,
+                         best_nonce: int, best_hash: str, hashes_computed: int):
+        """Submit proof that work was completed"""
+        try:
+            response = self.session.post(
+                f"{self.pool_url}/api/work_proof",
+                json={
+                    "miner_id": self.miner_id,
+                    "block_height": block_height,
+                    "nonce_start": nonce_start,
+                    "nonce_end": nonce_end,
+                    "best_nonce": best_nonce,
+                    "best_hash": best_hash,
+                    "hashes_computed": hashes_computed
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"❌ Error submitting work proof: {e}")
             return None
     
     def mine(self):
@@ -182,23 +205,41 @@ class PoolMiner:
                 )
                 
                 if result:
-                    nonce, block_content_hex, block_hash, is_valid_block = result
+                    result_type = result[0]
                     
-                    # Submit share
-                    response = self.submit_share(
-                        block_height,
-                        nonce,
-                        block_content_hex,
-                        block_hash,
-                        is_valid_block
-                    )
-                    
-                    if response:
-                        if response.get('block_found'):
+                    if result_type == 'block':
+                        # Valid block found!
+                        _, nonce, block_content_hex, block_hash = result
+                        
+                        response = self.submit_share(
+                            block_height,
+                            nonce,
+                            block_content_hex,
+                            block_hash,
+                            True  # is_valid_block
+                        )
+                        
+                        if response and response.get('block_found'):
                             print(f"🎉🎉🎉 BLOCK FOUND by Worker {worker_id + 1}! 🎉🎉🎉")
-                        elif response.get('success'):
-                            shares = response.get('shares_this_round', 0)
-                            print(f"✅ Worker {worker_id + 1}: Share accepted ({shares} shares this round)")
+                    
+                    elif result_type == 'proof':
+                        # Range completed, submit work proof
+                        _, best_nonce, best_hash, hashes_computed = result
+                        
+                        response = self.submit_work_proof(
+                            block_height,
+                            nonce_start,
+                            nonce_end,
+                            best_nonce,
+                            best_hash,
+                            hashes_computed
+                        )
+                        
+                        if response and response.get('success'):
+                            work_units = response.get('work_units', 0)
+                            print(f"✅ Worker {worker_id + 1}: Work proof accepted ({work_units} work units this round)")
+                        else:
+                            print(f"❌ Work proof error {response} {best_nonce}")
                 
             except KeyboardInterrupt:
                 raise
@@ -247,46 +288,58 @@ class PoolMiner:
             prefix = (2).to_bytes(1, 'little') + prefix
         
         # Mining loop - mine at FULL network difficulty
+        # Track best hash found for proof of work
         t = time.time()
         i = nonce_start
         hashrate_check = 5_000_000  # Report hashrate every 5M hashes (like Stellaris)
         timeout = 280  # Timeout after 280 seconds (like Stellaris)
         
+        best_nonce = nonce_start
+        best_hash = 'f' * 64  # Start with worst possible hash
+        hashes_computed = 0
+        
         while i < nonce_end:
             # Use 4 bytes for nonce (Stellaris format)
             block_content = prefix + i.to_bytes(4, 'little')
+            block_hash = hashlib.sha256(block_content).hexdigest()
+            hashes_computed += 1
+            
+            # Track best hash (hash that's closest to meeting difficulty)
+            if block_hash < best_hash:
+                best_hash = block_hash
+                best_nonce = i
             
             # Check if valid block (FULL network difficulty)
             if check_block_is_valid(block_content):
-                block_hash = hashlib.sha256(block_content).hexdigest()
                 elapsed = time.time() - t
-                hashrate = (i - nonce_start) / elapsed / 1000 if elapsed > 0 else 0
+                hashrate = hashes_computed / elapsed / 1000 if elapsed > 0 else 0
                 print(f"🎉🎉🎉 Worker {worker_id + 1}: VALID BLOCK FOUND! 🎉🎉🎉")
                 print(f"   Nonce: {i:,}")
                 print(f"   Hash: {block_hash}")
                 print(f"   Hashrate: {hashrate:.1f} kH/s")
-                return (i, block_content.hex(), block_hash, True)
+                return ('block', i, block_content.hex(), block_hash)
             
             i += 1
             
             # Print hashrate periodically
-            if (i - nonce_start) % hashrate_check == 0 and i > nonce_start:
+            if hashes_computed % hashrate_check == 0 and hashes_computed > 0:
                 elapsed = time.time() - t
                 if elapsed > 0:
-                    hashrate = (i - nonce_start) / elapsed / 1000
+                    hashrate = hashes_computed / elapsed / 1000
                     progress = (i - nonce_start) / (nonce_end - nonce_start) * 100
                     print(f"Worker {worker_id + 1}: {hashrate:.1f} kH/s ({progress:.1f}% of range)")
             
             # Timeout check (like Stellaris miner)
             if time.time() - t > timeout:
-                print(f"Worker {worker_id + 1}: Timeout reached ({timeout}s), requesting new work")
-                return None
+                print(f"Worker {worker_id + 1}: Timeout ({timeout}s), submitting work proof")
+                return ('proof', best_nonce, best_hash, hashes_computed)
         
-        # Range exhausted without finding block - this is normal
+        # Range exhausted without finding block - submit proof of work
         elapsed = time.time() - t
-        hashrate = (nonce_end - nonce_start) / elapsed / 1000 if elapsed > 0 else 0
-        print(f"Worker {worker_id + 1}: Range exhausted ({hashrate:.1f} kH/s), requesting new work")
-        return None
+        hashrate = hashes_computed / elapsed / 1000 if elapsed > 0 else 0
+        print(f"Worker {worker_id + 1}: Range exhausted ({hashrate:.1f} kH/s), submitting work proof")
+        print(f"   Best hash: {best_hash[:16]}...")
+        return ('proof', best_nonce, best_hash, hashes_computed)
 
 
 def main():

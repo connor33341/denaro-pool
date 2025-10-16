@@ -85,8 +85,10 @@ class PoolState:
         self.current_work_height: int = 0
         self.work_start_time: float = 0
         self.nonce_ranges: Dict[str, tuple] = {}  # miner_id -> (start, end)
+        self.work_assignments: Dict[str, Dict] = {}  # miner_id -> {range, timestamp, completed}
         self.next_nonce_start: int = 0
-        self.round_shares: Dict[str, int] = defaultdict(int)  # miner_id -> share_count
+        self.round_shares: Dict[str, int] = defaultdict(int)  # miner_id -> share_count (blocks found)
+        self.round_work: Dict[str, int] = defaultdict(int)  # miner_id -> work_units (ranges completed with proof)
         self.total_pool_hashrate: float = 0
         self.active_miners: Dict[str, Dict] = {}  # miner_id -> {last_seen, hashrate, shares}
         self.http_client: Optional[httpx.AsyncClient] = None
@@ -94,8 +96,10 @@ class PoolState:
     def reset_round(self):
         """Reset round data when starting new work"""
         self.nonce_ranges.clear()
+        self.work_assignments.clear()  # Clear work assignments
         self.next_nonce_start = 0
         self.round_shares.clear()
+        self.round_work.clear()  # Reset work tracking
         self.work_start_time = time.time()
     
     def update_miner_activity(self, miner_id: str, shares: int = 0, hashrate: float = 0):
@@ -164,6 +168,16 @@ class ShareSubmission(BaseModel):
     block_content_hex: str
     block_hash: str
     is_valid_block: bool = False
+
+
+class WorkProof(BaseModel):
+    miner_id: str
+    block_height: int
+    nonce_start: int
+    nonce_end: int
+    best_nonce: int  # Nonce that produced the best hash
+    best_hash: str  # Best hash found in the range
+    hashes_computed: int  # Number of hashes actually computed
 
 
 class PoolStats(BaseModel):
@@ -436,8 +450,23 @@ async def get_work_for_miner(miner_id: str) -> WorkAssignment:
     nonce_start = pool_state.next_nonce_start
     nonce_end = min(nonce_start + nonce_range_size, max_nonce)
     
+    # Store current timestamp for this work assignment
+    current_timestamp = int(time.time())
+    
+    # Track work assignment with timestamp for validation
+    pool_state.work_assignments[miner_id] = {
+        'nonce_start': nonce_start,
+        'nonce_end': nonce_end,
+        'block_height': pool_state.current_work_height,
+        'timestamp': current_timestamp,
+        'assigned_at': time.time(),
+        'completed': False
+    }
+    
     pool_state.nonce_ranges[miner_id] = (nonce_start, nonce_end)
     pool_state.next_nonce_start = nonce_end
+    
+    # Don't credit work units yet - must submit proof first
     
     # Update miner activity
     pool_state.update_miner_activity(miner_id)
@@ -447,7 +476,7 @@ async def get_work_for_miner(miner_id: str) -> WorkAssignment:
         difficulty=work['difficulty'],
         previous_hash=work['last_block'].get('hash', (30_06_2005).to_bytes(32, ENDIAN).hex()),
         merkle_root=work['merkle_root'],
-        timestamp=int(time.time()),
+        timestamp=current_timestamp,  # Send the timestamp to miner
         nonce_start=nonce_start,
         nonce_end=nonce_end,
         pool_address=POOL_WALLET_ADDRESS,
@@ -576,6 +605,133 @@ async def get_work(request: WorkRequest):
         raise HTTPException(status_code=500, detail=f"Cannot assign work: {str(e)}")
 
 
+@app.post("/api/work_proof")
+async def submit_work_proof(proof: WorkProof):
+    """
+    Submit proof that a miner completed their assigned work range.
+    This prevents miners from spamming work requests without actually mining.
+    """
+    try:
+        # Validate proof is for current work
+        if proof.block_height != pool_state.current_work_height:
+            return {
+                "success": False,
+                "message": "Proof is for old work"
+            }
+        
+        # Check if this miner was assigned this work
+        if proof.miner_id not in pool_state.work_assignments:
+            return {
+                "success": False,
+                "message": "No work assignment found for this miner"
+            }
+        
+        assignment = pool_state.work_assignments[proof.miner_id]
+        
+        # Check if already completed
+        if assignment.get('completed'):
+            return {
+                "success": False,
+                "message": "Work already submitted"
+            }
+        
+        # Validate nonce range matches assignment
+        if (proof.nonce_start != assignment['nonce_start'] or 
+            proof.nonce_end != assignment['nonce_end']):
+            return {
+                "success": False,
+                "message": "Nonce range doesn't match assignment"
+            }
+        
+        # Validate best_nonce is within assigned range
+        if not (proof.nonce_start <= proof.best_nonce < proof.nonce_end):
+            return {
+                "success": False,
+                "message": "Best nonce is outside assigned range"
+            }
+        
+        # Validate timing (prevent impossibly fast completion)
+        time_elapsed = time.time() - assignment['assigned_at']
+        range_size = proof.nonce_end - proof.nonce_start
+        
+        # Minimum time check: can't hash faster than 1 billion H/s (very generous)
+        min_time_required = range_size / 1_000_000_000  # seconds
+        if time_elapsed < min_time_required:
+            print(f"⚠️  Suspicious timing from {proof.miner_id}: {time_elapsed:.2f}s for {range_size:,} hashes")
+            return {
+                "success": False,
+                "message": "Work completed suspiciously fast"
+            }
+        
+        # Verify the hash is correct by recomputing it
+        if not pool_state.current_work:
+            return {"success": False, "message": "No current work"}
+        
+        work = pool_state.current_work
+        difficulty = work['difficulty']
+        previous_hash = work['last_block'].get('hash', (30_06_2005).to_bytes(32, ENDIAN).hex())
+        merkle_root = work['merkle_root']
+        timestamp = assignment.get('timestamp', int(time.time()))
+        
+        # Reconstruct the block content and verify the hash
+        from stellaris.utils.general import string_to_bytes
+        address_bytes = string_to_bytes(POOL_WALLET_ADDRESS)
+        
+        prefix = (
+            bytes.fromhex(previous_hash) +
+            address_bytes +
+            bytes.fromhex(merkle_root) +
+            timestamp.to_bytes(4, byteorder='little') +
+            int(difficulty * 10).to_bytes(2, 'little')
+        )
+        
+        if len(address_bytes) == 33:
+            prefix = (2).to_bytes(1, 'little') + prefix
+        
+        block_content = prefix + proof.best_nonce.to_bytes(4, 'little')
+        computed_hash = hashlib.sha256(block_content).hexdigest()
+        
+        if computed_hash != proof.best_hash:
+            print(f"⚠️  Hash verification failed for {proof.miner_id}")
+            print(f"   Expected: {proof.best_hash}")
+            print(f"   Computed: {computed_hash}")
+            return {
+                "success": False,
+                "message": "Hash verification failed - proof is invalid"
+            }
+        
+        # Valid proof! Credit the miner with work units
+        assignment['completed'] = True
+        pool_state.round_work[proof.miner_id] += 1
+        
+        # Update miner activity
+        pool_state.update_miner_activity(proof.miner_id, shares=0)
+        
+        # Calculate hashrate
+        hashrate = proof.hashes_computed / time_elapsed if time_elapsed > 0 else 0
+        
+        print(f"✅ Valid work proof from {proof.miner_id}")
+        print(f"   Range: {proof.nonce_start:,} - {proof.nonce_end:,}")
+        print(f"   Time: {time_elapsed:.1f}s")
+        print(f"   Hashrate: {hashrate/1000:.1f} kH/s")
+        print(f"   Work units this round: {pool_state.round_work[proof.miner_id]}")
+        
+        return {
+            "success": True,
+            "message": "Work proof accepted",
+            "work_units": pool_state.round_work[proof.miner_id]
+        }
+        
+    except Exception as e:
+        print(f"❌ Work proof error from {proof.miner_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Work proof processing failed: {str(e)}"
+        }
+
+
 @app.post("/api/share")
 async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks):
     """
@@ -660,12 +816,15 @@ async def get_pool_stats():
     pool_state.calculate_pool_hashrate()
     active_miners = pool_state.get_active_miners()
     
+    # Calculate total work units this round
+    total_work_units = sum(pool_state.round_work.values())
+    
     return PoolStats(
         total_hashrate=pool_state.total_pool_hashrate,
         active_miners=len(active_miners),
         current_block_height=pool_state.current_work_height,
         current_difficulty=pool_state.current_work['difficulty'] if pool_state.current_work else 0,
-        shares_this_round=sum(pool_state.round_shares.values()),
+        shares_this_round=total_work_units,  # Now represents work units, not shares
         pool_fee_percent=POOL_FEE_PERCENT,
         finder_bonus_percent=FINDER_BONUS_PERCENT
     )
@@ -679,8 +838,8 @@ async def get_miner_stats(miner_id: str):
     if not stats:
         raise HTTPException(status_code=404, detail="Miner not found")
     
-    # Get current round stats
-    current_shares = pool_state.round_shares.get(miner_id, 0)
+    # Get current round stats (work units, not just blocks found)
+    current_work_units = pool_state.round_work.get(miner_id, 0)
     current_hashrate = pool_state.active_miners.get(miner_id, {}).get('hashrate', 0)
     
     return MinerStats(
@@ -688,7 +847,7 @@ async def get_miner_stats(miner_id: str):
         wallet_address=stats['wallet_address'],
         current_hashrate=current_hashrate,
         shares_submitted=stats['total_shares'],
-        shares_this_round=current_shares,
+        shares_this_round=current_work_units,  # Work units this round
         total_paid=str(stats['total_paid']),
         pending_balance=str(stats['pending_balance']),
         blocks_found=stats['blocks_found'],
@@ -737,33 +896,34 @@ async def handle_found_block(miner_id: str, block_height: int, block_content: st
 
 
 async def calculate_and_record_payouts(finder_id: str, reward: Decimal, block_height: int):
-    """Calculate payout distribution based on shares"""
+    """Calculate payout distribution based on work contributed"""
     try:
         # Deduct pool fee
         pool_fee = reward * Decimal(POOL_FEE_PERCENT) / Decimal(100)
         distributable = reward - pool_fee
         
-        # Calculate finder bonus
+        # Calculate finder bonus (extra reward for finding the block)
         finder_bonus_amount = distributable * Decimal(FINDER_BONUS_PERCENT) / Decimal(100)
         remaining = distributable - finder_bonus_amount
         
-        # Get all shares for this round
-        total_shares = sum(pool_state.round_shares.values())
+        # Get all work units contributed this round
+        total_work = sum(pool_state.round_work.values())
         
-        if total_shares == 0:
-            print("⚠️  No shares in round, all reward goes to finder")
+        if total_work == 0:
+            print("⚠️  No work units in round, all reward goes to finder")
             finder_bonus_amount = distributable
             remaining = Decimal(0)
         
-        # Calculate payout per share
+        # Calculate payout per work unit
+        # Each miner gets paid proportionally to the work they contributed
         payouts = {}
         
-        if remaining > 0:
-            for miner_id, shares in pool_state.round_shares.items():
-                share_reward = (remaining * Decimal(shares)) / Decimal(total_shares)
+        if remaining > 0 and total_work > 0:
+            for miner_id, work_units in pool_state.round_work.items():
+                share_reward = (remaining * Decimal(work_units)) / Decimal(total_work)
                 payouts[miner_id] = payouts.get(miner_id, Decimal(0)) + share_reward
         
-        # Add finder bonus
+        # Add finder bonus to the miner who found the block
         payouts[finder_id] = payouts.get(finder_id, Decimal(0)) + finder_bonus_amount
         
         # Update pending balances in database
@@ -778,9 +938,13 @@ async def calculate_and_record_payouts(finder_id: str, reward: Decimal, block_he
         await db.add_payout_records(payout_records, block_height)
         
         print(f"💰 Payouts calculated for block #{block_height}")
-        print(f"   Pool Fee: {pool_fee}")
-        print(f"   Finder Bonus: {finder_bonus_amount} -> {finder_id}")
-        print(f"   Total Payouts: {len(payouts)} miners")
+        print(f"   Pool Fee: {pool_fee} DNR")
+        print(f"   Finder Bonus: {finder_bonus_amount} DNR -> {finder_id}")
+        print(f"   Total Work Units: {total_work}")
+        print(f"   Miners Rewarded: {len(payouts)}")
+        for miner_id, amount in payouts.items():
+            work_units = pool_state.round_work.get(miner_id, 0)
+            print(f"     {miner_id}: {amount} DNR ({work_units} work units)")
         
     except Exception as e:
         print(f"❌ Error calculating payouts: {e}")

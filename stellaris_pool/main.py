@@ -714,11 +714,11 @@ async def submit_work_proof(proof: WorkProof):
         assignment['completed'] = True
         pool_state.round_work[proof.miner_id] += 1
         
-        # Update miner activity
-        pool_state.update_miner_activity(proof.miner_id, shares=0)
-        
         # Calculate hashrate
         hashrate = proof.hashes_computed / time_elapsed if time_elapsed > 0 else 0
+        
+        # Update miner activity with hashrate
+        pool_state.update_miner_activity(proof.miner_id, shares=0, hashrate=hashrate)
         
         print(f"✅ Valid work proof from {proof.miner_id}")
         print(f"   Range: {proof.nonce_start:,} - {proof.nonce_end:,}")

@@ -91,6 +91,8 @@ class PoolState:
         self.round_work: Dict[str, int] = defaultdict(int)  # miner_id -> work_units (ranges completed with proof)
         self.total_pool_hashrate: float = 0
         self.active_miners: Dict[str, Dict] = {}  # miner_id -> {last_seen, hashrate, shares}
+        self.submitted_blocks: set = set()  # Track submitted block hashes to prevent duplicates
+        self.block_found_for_height: Optional[int] = None  # Track if a block was already found for current height
         self.http_client: Optional[httpx.AsyncClient] = None
     
     def reset_round(self):
@@ -100,6 +102,8 @@ class PoolState:
         self.next_nonce_start = 0
         self.round_shares.clear()
         self.round_work.clear()  # Reset work tracking
+        self.submitted_blocks.clear()  # Clear submitted blocks for new round
+        self.block_found_for_height = None  # Reset block found tracker
         self.work_start_time = time.time()
     
     def update_miner_activity(self, miner_id: str, shares: int = 0, hashrate: float = 0):
@@ -760,6 +764,13 @@ async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks
                 "current_height": pool_state.current_work_height
             }
         
+        # Check if a block has already been found and accepted for this height
+        if pool_state.block_found_for_height == share.block_height:
+            return {
+                "success": False,
+                "message": "Block already found for this height"
+            }
+        
         # Validate the block
         difficulty = pool_state.current_work['difficulty']
         is_valid_share, is_valid_block = validate_share(share.block_hash, difficulty)
@@ -773,9 +784,24 @@ async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks
                 "message": "Block does not meet network difficulty"
             }
         
+        # Check if this block has already been submitted (prevent duplicate submissions)
+        if share.block_hash in pool_state.submitted_blocks:
+            print(f"⚠️  {share.miner_id} submitted duplicate block: {share.block_hash}")
+            return {
+                "success": False,
+                "message": "Block already submitted"
+            }
+        
+        # Mark this block as submitted
+        pool_state.submitted_blocks.add(share.block_hash)
+        
+        # Mark that a block has been found for this height (prevent multiple blocks for same height)
+        pool_state.block_found_for_height = share.block_height
+        
         # Valid block found!
         print(f"🎉 VALID BLOCK FOUND by {share.miner_id}! Block #{share.block_height}")
         print(f"   Hash: {share.block_hash}")
+        print(f"   Rejecting further submissions for this height")
         
         # Record block in database (track who found it for rewards)
         await record_share_db(
@@ -788,6 +814,11 @@ async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks
         
         # Update round stats - this miner found the block!
         pool_state.round_shares[share.miner_id] += 1
+        
+        # Automatically grant 10 work units for finding the block
+        pool_state.round_work[share.miner_id] += 10
+        print(f"   Awarded 10 work units for finding block (total: {pool_state.round_work[share.miner_id]})")
+        
         pool_state.update_miner_activity(share.miner_id, shares=1)
         
         # Submit block to network

@@ -85,7 +85,7 @@ class PoolState:
         self.current_work_height: int = 0
         self.work_start_time: float = 0
         self.nonce_ranges: Dict[str, tuple] = {}  # miner_id -> (start, end)
-        self.work_assignments: Dict[str, Dict] = {}  # miner_id -> {range, timestamp, completed}
+        self.work_assignments: Dict[str, Dict] = {}  # "miner_id:start:end" -> {range, timestamp, completed}
         self.next_nonce_start: int = 0
         self.round_shares: Dict[str, int] = defaultdict(int)  # miner_id -> share_count (blocks found)
         self.round_work: Dict[str, int] = defaultdict(int)  # miner_id -> work_units (ranges completed with proof)
@@ -454,7 +454,10 @@ async def get_work_for_miner(miner_id: str) -> WorkAssignment:
     current_timestamp = int(time.time())
     
     # Track work assignment with timestamp for validation
-    pool_state.work_assignments[miner_id] = {
+    # Use unique key: miner_id:nonce_start:nonce_end to support multiple ranges per miner
+    assignment_key = f"{miner_id}:{nonce_start}:{nonce_end}"
+    pool_state.work_assignments[assignment_key] = {
+        'miner_id': miner_id,
         'nonce_start': nonce_start,
         'nonce_end': nonce_end,
         'block_height': pool_state.current_work_height,
@@ -620,13 +623,14 @@ async def submit_work_proof(proof: WorkProof):
             }
         
         # Check if this miner was assigned this work
-        if proof.miner_id not in pool_state.work_assignments:
+        assignment_key = f"{proof.miner_id}:{proof.nonce_start}:{proof.nonce_end}"
+        if assignment_key not in pool_state.work_assignments:
             return {
                 "success": False,
-                "message": "No work assignment found for this miner"
+                "message": "No work assignment found for this miner and range"
             }
         
-        assignment = pool_state.work_assignments[proof.miner_id]
+        assignment = pool_state.work_assignments[assignment_key]
         
         # Check if already completed
         if assignment.get('completed'):
@@ -635,12 +639,11 @@ async def submit_work_proof(proof: WorkProof):
                 "message": "Work already submitted"
             }
         
-        # Validate nonce range matches assignment
-        if (proof.nonce_start != assignment['nonce_start'] or 
-            proof.nonce_end != assignment['nonce_end']):
+        # Validate block height matches (proof might be stale if new block found)
+        if proof.block_height != assignment['block_height']:
             return {
                 "success": False,
-                "message": "Nonce range doesn't match assignment"
+                "message": "Proof is for wrong block height"
             }
         
         # Validate best_nonce is within assigned range

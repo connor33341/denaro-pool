@@ -93,6 +93,7 @@ class PoolState:
         self.active_miners: Dict[str, Dict] = {}  # miner_id -> {last_seen, hashrate, shares}
         self.submitted_blocks: set = set()  # Track submitted block hashes to prevent duplicates
         self.block_found_for_height: Optional[int] = None  # Track if a block was already found for current height
+        self.block_submission_time: Optional[float] = None  # Track when block was submitted (for timeout detection)
         self.http_client: Optional[httpx.AsyncClient] = None
     
     def reset_round(self):
@@ -104,6 +105,7 @@ class PoolState:
         self.round_work.clear()  # Reset work tracking
         self.submitted_blocks.clear()  # Clear submitted blocks for new round
         self.block_found_for_height = None  # Reset block found tracker
+        self.block_submission_time = None  # Reset submission time
         self.work_start_time = time.time()
     
     def update_miner_activity(self, miner_id: str, shares: int = 0, hashrate: float = 0):
@@ -555,8 +557,9 @@ async def startup_event():
     # Fetch initial work
     await update_work()
     
-    # Start background task to update work periodically
+    # Start background tasks
     asyncio.create_task(work_updater_task())
+    asyncio.create_task(block_submission_watchdog_task())
     asyncio.create_task(payout_processor_task())
     
     print(f"✅ Pool initialized successfully")
@@ -807,6 +810,7 @@ async def submit_share(share: ShareSubmission, background_tasks: BackgroundTasks
         
         # Mark that a block has been found for this height (prevent multiple blocks for same height)
         pool_state.block_found_for_height = share.block_height
+        pool_state.block_submission_time = time.time()  # Record submission time for timeout detection
         
         # Valid block found!
         print(f"🎉 VALID BLOCK FOUND by {share.miner_id}! Block #{share.block_height}")
@@ -913,6 +917,37 @@ async def work_updater_task():
             print(f"❌ Error in work updater: {e}")
 
 
+async def block_submission_watchdog_task():
+    """Background task to detect and unlock stuck block submissions"""
+    SUBMISSION_TIMEOUT = 60  # seconds - if block submission takes longer than this, unlock the pool
+    
+    while True:
+        try:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            
+            # Check if pool is locked with a pending block submission
+            if pool_state.block_found_for_height is not None and pool_state.block_submission_time is not None:
+                time_since_submission = time.time() - pool_state.block_submission_time
+                
+                if time_since_submission > SUBMISSION_TIMEOUT:
+                    print(f"⚠️  Block submission timeout detected!")
+                    print(f"   Block for height #{pool_state.block_found_for_height} has been pending for {time_since_submission:.1f}s")
+                    print(f"   Unlocking pool and fetching new work...")
+                    
+                    # Unlock the pool
+                    pool_state.submitted_blocks.clear()
+                    pool_state.block_found_for_height = None
+                    pool_state.block_submission_time = None
+                    
+                    # Fetch new work
+                    await update_work()
+                    
+                    print(f"✅ Pool unlocked by watchdog, miners can continue")
+                    
+        except Exception as e:
+            print(f"❌ Error in block submission watchdog: {e}")
+
+
 async def handle_found_block(miner_id: str, block_height: int, block_content: str, block_hash: str):
     """Handle a found block - submit to network and calculate payouts"""
     try:
@@ -922,6 +957,9 @@ async def handle_found_block(miner_id: str, block_height: int, block_content: st
         
         if result.get('ok'):
             print(f"✅ Block #{block_height} accepted by network!")
+            
+            # Clear submission tracking
+            pool_state.block_submission_time = None
             
             # Get the actual block reward using Stellaris reward calculation
             block_reward = get_block_reward(block_height)
@@ -937,9 +975,44 @@ async def handle_found_block(miner_id: str, block_height: int, block_content: st
             await update_work()
         else:
             print(f"❌ Block #{block_height} rejected by network: {result}")
+            print(f"   Unlocking pool and fetching new work...")
+            
+            # CRITICAL: Unlock the pool so mining can continue
+            # Remove the block from submitted blocks set
+            if block_hash in pool_state.submitted_blocks:
+                pool_state.submitted_blocks.discard(block_hash)
+            
+            # Clear the block found flag for this height
+            if pool_state.block_found_for_height == block_height:
+                pool_state.block_found_for_height = None
+            
+            # Clear submission time
+            pool_state.block_submission_time = None
+            
+            # Fetch new work immediately - the network state may have changed
+            await update_work()
+            
+            print(f"✅ Pool unlocked, miners can continue submitting blocks for height #{pool_state.current_work_height}")
             
     except Exception as e:
         print(f"❌ Error handling found block: {e}")
+        print(f"   Unlocking pool due to error...")
+        
+        # Also unlock on exception to prevent permanent lock
+        if block_hash in pool_state.submitted_blocks:
+            pool_state.submitted_blocks.discard(block_hash)
+        
+        if pool_state.block_found_for_height == block_height:
+            pool_state.block_found_for_height = None
+        
+        # Clear submission time
+        pool_state.block_submission_time = None
+        
+        # Try to fetch new work
+        try:
+            await update_work()
+        except Exception as update_error:
+            print(f"❌ Failed to fetch new work after error: {update_error}")
 
 
 async def calculate_and_record_payouts(finder_id: str, reward: Decimal, block_height: int):

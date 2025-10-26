@@ -38,7 +38,7 @@ fi
 
 # Get host and port from arguments or use defaults
 HOST=${1:-"0.0.0.0"}
-PORT=${2:-"8000"}
+PORT=${2:-"8572"}
 
 echo -e "${GREEN}Starting Stellaris Pool on $HOST:$PORT${NC}"
 echo -e "${YELLOW}Press Ctrl+C to stop${NC}"

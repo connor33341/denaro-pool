@@ -345,8 +345,8 @@ class PoolMiner:
 def main():
     parser = argparse.ArgumentParser(description='Stellaris Pool Miner')
     parser.add_argument('wallet_address', help='Your Stellaris wallet address')
-    parser.add_argument('--pool', default='https://stellaris-pool.connor33341.dev', 
-                       help='Pool URL (default: https://stellaris-pool.connor33341.dev)')
+    parser.add_argument('--pool', default='https://denaro-pool.connor33341.dev', 
+                       help='Pool URL (default: https://denaro-pool.connor33341.dev)')
     parser.add_argument('--workers', type=int, default=1, 
                        help='Number of worker processes (default: 1)')
     parser.add_argument('--name', help='Worker name (optional)')
